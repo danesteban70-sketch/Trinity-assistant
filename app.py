@@ -1,36 +1,66 @@
-import chainlit as cl
+import os
+import json
 import requests
+from flask import Flask, request, jsonify, send_file
 
-MAKE_WEBHOOK_URL = "https://hook.us2.make.com/mn8gnb5ov1ehe1iwygyx1jphavkfxlb9"
+# URL del webhook de Make.com (puedes sobreescribirla con la variable de entorno MAKE_WEBHOOK)
+MAKE_WEBHOOK = os.environ.get(
+    "MAKE_WEBHOOK",
+    "https://hook.us2.make.com/mn8gnb5ov1ehe1iwygyx1jphavkfxlb9"
+)
 
-@cl.on_chat_start
-async def start():
-    await cl.Message(
-        content="Saludos, Señor. Soy Trinity. Sistema en línea. ¿Qué instrucciones tiene para la agenda de hoy?"
-    ).send()
+app = Flask(__name__)
 
-@cl.on_message
-async def main(message: cl.Message):
-    msg = cl.Message(content="")
-    await msg.send()
 
+@app.get("/")
+def home():
+    return send_file("static/index.html")
+
+
+def parse_reply(raw):
+    """Detecta el formato de la respuesta de Gemini/Make y devuelve texto plano."""
+    text = (raw or "").strip()
     try:
-        response = requests.post(
-            MAKE_WEBHOOK_URL, 
-            json={"message": message.content, "user": "Señor"},
-            timeout=30
-        )
+        data = json.loads(text)
+    except Exception:
+        return text  # era texto plano
 
-        if response.status_code == 200:
-            try:
-                 data = response.json()
-                 reply_text = data.get("response", "Operación procesada con éxito, Señor.")
-            except ValueError:
-                 reply_text = response.text if response.text else "Entendido, Señor."
-        else:
-            reply_text = f"Disculpe, Señor, el servidor respondió con el código {response.status_code}."
+    if isinstance(data, str):
+        return data
+    # Formato nativo de respuesta de Gemini API
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        pass
+    # Formato de contenido Gemini (por si Make responde con el mismo shape de entrada)
+    if isinstance(data, dict) and isinstance(data.get("parts"), list):
+        return "".join(p.get("text", "") for p in data["parts"] if isinstance(p, dict))
+    # Claves comunes
+    for k in ("reply", "text", "answer", "output", "result", "content", "message"):
+        if k in data:
+            return str(data[k])
+    return text
+
+
+@app.post("/chat")
+def chat():
+    user_text = (request.json or {}).get("text", "").strip()
+    if not user_text:
+        return jsonify({"ok": False, "error": "Mensaje vacío"}), 400
+
+    # Mismo formato que tu escenario de Make ya espera
+    payload = {"role": "user", "parts": [{"text": user_text}]}
+    try:
+        r = requests.post(MAKE_WEBHOOK, json=payload, timeout=90)
+        reply = parse_reply(r.text)
+        if not reply:
+            return jsonify({"ok": False, "error": "Respuesta vacía de Make/Gemini", "raw": r.text[:500]}), 502
+        return jsonify({"ok": True, "reply": reply})
+    except requests.Timeout:
+        return jsonify({"ok": False, "error": "Gemini tardó demasiado, intenta de nuevo"}), 504
     except Exception as e:
-        reply_text = f"Error de conexión: {str(e)}"
+        return jsonify({"ok": False, "error": str(e)}), 502
 
-    msg.content = reply_text
-    await msg.update()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
